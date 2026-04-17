@@ -107,9 +107,16 @@ Q: Why is linux so much more complicated to setup?
 ### Requirements
 
 #### 3DS Application
+
+You need one of following group of dependencies:
+
+##### Native build
 - DevkitPro and DevkitARM
 - 3DS development libraries (libctru)
 - Make utility
+
+##### Container build
+- Docker or Podman
 
 #### PC Application
 - Python 3.6+
@@ -117,6 +124,8 @@ Q: Why is linux so much more complicated to setup?
 - Linux: uinput module and headers
 
 # Building 3DS Application (not that you care lol)
+
+## Using native tools (Windows/Linux)
 
 1. Install DevkitPro with 3DS support
    ```
@@ -172,6 +181,28 @@ Q: Why is linux so much more complicated to setup?
    ```
 
 6. Output files:
+   - `3ds_controller.3dsx` (Homebrew format)
+   - `3ds_controller.cia` (CIA format for installation via FBI)
+
+## Container build (Linux or WSL)
+
+1. Clone repository
+   ```
+   git clone https://github.com/icicle1133/3ds-controller.git
+   cd 3ds-controller
+   ```
+
+2. Build application (Replace podman by docker if using Docker)
+   ```
+   # For 3DSX file
+   podman run -v $(pwd):/home-ext --workdir /home-ext -it --rm --name 3ds docker.io/devkitpro/devkitarm:latest make clean
+   podman run -v $(pwd):/home-ext --workdir /home-ext -it --rm --name 3ds docker.io/devkitpro/devkitarm:latest make
+
+   # For CIA file
+   podman run -v $(pwd):/home-ext --workdir /home-ext -it --rm --name 3ds docker.io/devkitpro/devkitarm:latest make cia
+   ```
+
+3. Output files:
    - `3ds_controller.3dsx` (Homebrew format)
    - `3ds_controller.cia` (CIA format for installation via FBI)
 
