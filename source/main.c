@@ -14,24 +14,25 @@
 #define DEFAULT_SERVER_IP "192.168.1.1"
 #define CONFIG_FILE "config.ini"
 #define MAX_LINE 256
-#define LCD_TOGGLE_KEY KEY_SELECT
+#define LCD_TOGGLE_KEY KEY_L
 #define CONNECTION_TIMEOUT_MS 5000
-#define LCD_TOGGLE_HOLD_TIME 5000  // 5 seconds hold time for LCD toggle
 
 typedef struct {
-    u32 buttons;            
-    circlePosition circlepad; 
-    circlePosition cstick;  
+    u32 buttons;            // 4 bytes
+    circlePosition circlepad; // 4 bytes (x, y as s16)
+    circlePosition cstick;  // 4 bytes (x, y as s16)
 } controllerstate;
 
 typedef struct {
     char serverip[64];
     int port;
+    u32 lcdtogglekey;
 } config;
 
 void readconfigfile(config *cfg) {
     strcpy(cfg->serverip, DEFAULT_SERVER_IP);
     cfg->port = DEFAULT_PORT;
+    cfg->lcdtogglekey = LCD_TOGGLE_KEY;
     
     FILE *file = fopen(CONFIG_FILE, "r");
     if (!file) {
@@ -42,6 +43,7 @@ void readconfigfile(config *cfg) {
         if (file) {
             fprintf(file, "serverip=%s\n", DEFAULT_SERVER_IP);
             fprintf(file, "port=%d\n", DEFAULT_PORT);
+            fprintf(file, "lcdtogglekey=KEY_L\n");
             fclose(file);
             printf("default config file created at %s\n", CONFIG_FILE);
         } else {
@@ -68,6 +70,12 @@ void readconfigfile(config *cfg) {
                 strcpy(cfg->serverip, value);
             } else if (strcmp(key, "port") == 0) {
                 cfg->port = atoi(value);
+            } else if (strcmp(key, "lcdtogglekey") == 0) {
+                if (strcmp(value, "KEY_L") == 0) cfg->lcdtogglekey = KEY_L;
+                else if (strcmp(value, "KEY_R") == 0) cfg->lcdtogglekey = KEY_R;
+                else if (strcmp(value, "KEY_ZL") == 0) cfg->lcdtogglekey = KEY_ZL;
+                else if (strcmp(value, "KEY_ZR") == 0) cfg->lcdtogglekey = KEY_ZR;
+                else if (strcmp(value, "KEY_SELECT") == 0) cfg->lcdtogglekey = KEY_SELECT;
             }
         }
     }
@@ -105,8 +113,6 @@ int initsocket(const config *cfg) {
     int flags = fcntl(sockfd, F_GETFL, 0);
     fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
     
-    // Remove the problematic setsockopt line completely
-    
     return sockfd;
 }
 
@@ -126,7 +132,7 @@ int checkconnection(int sockfd) {
     FD_ZERO(&readfds);
     FD_SET(sockfd, &readfds);
     
-    timeout.tv_sec = 1;
+    timeout.tv_sec = 4;
     timeout.tv_usec = 0;
     
     if (select(sockfd + 1, &readfds, NULL, NULL, &timeout) > 0) {
@@ -154,20 +160,20 @@ void getbatterystatus(char *buffer, size_t size) {
     PTMU_GetBatteryChargeState(&charging);
     
     char icon[6];
+    int level = percentage;
     
-    // Convert battery level (0-4) to percentage (20-100)
-    int actualpercentage = (percentage + 1) * 20;
-    if (actualpercentage > 100) actualpercentage = 100;
+    if (level < 0) level = 0;
+    if (level > 4) level = 4;
     
     for (int i = 0; i < 5; i++) {
-        icon[i] = (i <= percentage) ? '|' : ' ';
+        icon[i] = (i <= level) ? '|' : ' ';
     }
     icon[5] = '\0';
     
     if (charging) {
         snprintf(buffer, size, "[%s] +", icon);
     } else {
-        snprintf(buffer, size, "[%s] %d%%", icon, actualpercentage);
+        snprintf(buffer, size, "[%s] %d%%", icon, (level + 1) * 20);
     }
 }
 
@@ -204,7 +210,14 @@ void printstatusmessage(int sockfd, const config *cfg, int isconnected, int lcds
     printf("\x1b[12;0H| A/B/X/Y: Face Buttons |");
     printf("\x1b[13;0H| L/R/ZL/ZR: Triggers   |");
     printf("\x1b[14;0H| D-Pad: Directional    |");
-    printf("\x1b[15;0H| Hold SELECT: Toggle LCD|");
+    
+    char keylabel[10] = "L";
+    if (cfg->lcdtogglekey == KEY_R) strcpy(keylabel, "R");
+    else if (cfg->lcdtogglekey == KEY_ZL) strcpy(keylabel, "ZL");
+    else if (cfg->lcdtogglekey == KEY_ZR) strcpy(keylabel, "ZR");
+    else if (cfg->lcdtogglekey == KEY_SELECT) strcpy(keylabel, "SELECT");
+    
+    printf("\x1b[15;0H| Hold %s: Toggle LCD   |", keylabel);
     printf("\x1b[16;0H| START+SELECT: Exit    |");
     printf("\x1b[17;0H+----------------------+");
 }
@@ -250,8 +263,7 @@ int main(int argc, char **argv) {
         
         u32 currenttime = osGetTime();
         
-        // Check connection more frequently
-        if (currenttime - connectionchecktime > 1000) {
+        if (currenttime - connectionchecktime > 5000) {
             isconnected = checkconnection(sockfd);
             connectionchecktime = currenttime;
             
@@ -263,11 +275,10 @@ int main(int argc, char **argv) {
             }
         }
         
-        // Handle LCD toggle with SELECT button only, 5 second hold time
-        if (keysdown & LCD_TOGGLE_KEY) {
+        if (keysdown & cfg.lcdtogglekey) {
             if (lcdtoggleheldtime == 0) {
                 lcdtoggleheldtime = currenttime;
-            } else if (currenttime - lcdtoggleheldtime > LCD_TOGGLE_HOLD_TIME) {
+            } else if (currenttime - lcdtoggleheldtime > 1000) {
                 lcdstate = !lcdstate;
                 if (lcdstate) {
                     gspLcdInit();
@@ -289,13 +300,10 @@ int main(int argc, char **argv) {
         hidCstickRead(&state.cstick);
         
         if (isconnected) {
-            if (sendcontrollerstate(sockfd, &state) < 0) {
-                // If send fails, mark as disconnected to trigger reconnect
-                isconnected = 0;
-            }
+            sendcontrollerstate(sockfd, &state);
         }
         
-        if (currenttime - laststatusupdate > 1000) {
+        if (currenttime - laststatusupdate > 3000) {
             printstatusmessage(sockfd, &cfg, isconnected, lcdstate);
             laststatusupdate = currenttime;
         }
@@ -305,8 +313,8 @@ int main(int argc, char **argv) {
         
         gspWaitForVBlank();
 
-        // Reduced sleep time to improve responsiveness
-        svcSleepThread(16666666);  // ~60fps
+        // i accidently flooded my network so this was added lol
+        svcSleepThread(33333333);
     }
     
     if (sockfd >= 0) {
