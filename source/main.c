@@ -3,24 +3,26 @@
 #include <string.h>
 #include <stdlib.h>
 #include <malloc.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <unistd.h>
+#include <errno.h>
 #include <fcntl.h>
-#include <netdb.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
 
+#define SOC_ALIGN       0x1000
+#define SOC_BUFFERSIZE  0x100000
 #define DEFAULT_PORT 8888
 #define DEFAULT_SERVER_IP "192.168.1.1"
 #define CONFIG_FILE "config.ini"
 #define MAX_LINE 256
 #define LCD_TOGGLE_KEY KEY_L
-#define CONNECTION_TIMEOUT_MS 5000
 
 typedef struct {
-    u32 buttons;            // 4 bytes
-    circlePosition circlepad; // 4 bytes (x, y as s16)
-    circlePosition cstick;  // 4 bytes (x, y as s16)
+    u32 buttons;
+    circlePosition circlepad;
+    circlePosition cstick;
 } controllerstate;
 
 typedef struct {
@@ -36,18 +38,12 @@ void readconfigfile(config *cfg) {
     
     FILE *file = fopen(CONFIG_FILE, "r");
     if (!file) {
-        printf("config.ini not found at %s, using defaults\n", CONFIG_FILE);
-        printf("creating default config file...\n");
-        
         file = fopen(CONFIG_FILE, "w");
         if (file) {
             fprintf(file, "serverip=%s\n", DEFAULT_SERVER_IP);
             fprintf(file, "port=%d\n", DEFAULT_PORT);
             fprintf(file, "lcdtogglekey=KEY_L\n");
             fclose(file);
-            printf("default config file created at %s\n", CONFIG_FILE);
-        } else {
-            printf("failed to create default config file\n");
         }
         return;
     }
@@ -55,19 +51,17 @@ void readconfigfile(config *cfg) {
     char line[MAX_LINE];
     while (fgets(line, MAX_LINE, file)) {
         size_t len = strlen(line);
-        if (len > 0 && line[len-1] == '\n') {
-            line[len-1] = '\0';
-        }
+        if (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[len-1] = '\0';
+        if (len > 1 && (line[len-2] == '\r')) line[len-2] = '\0';
         
-        char *key = strtok(line, "=");
-        char *value = strtok(NULL, "=");
-        
-        if (key && value) {
-            while (*key && (*key == ' ' || *key == '\t')) key++;
-            while (*value && (*value == ' ' || *value == '\t')) value++;
+        char * delimiter = strchr(line, '=');
+        if (delimiter) {
+            *delimiter = '\0';
+            char *key = line;
+            char *value = delimiter + 1;
             
             if (strcmp(key, "serverip") == 0) {
-                strcpy(cfg->serverip, value);
+                strncpy(cfg->serverip, value, sizeof(cfg->serverip) - 1);
             } else if (strcmp(key, "port") == 0) {
                 cfg->port = atoi(value);
             } else if (strcmp(key, "lcdtogglekey") == 0) {
@@ -76,253 +70,159 @@ void readconfigfile(config *cfg) {
                 else if (strcmp(value, "KEY_ZL") == 0) cfg->lcdtogglekey = KEY_ZL;
                 else if (strcmp(value, "KEY_ZR") == 0) cfg->lcdtogglekey = KEY_ZR;
                 else if (strcmp(value, "KEY_SELECT") == 0) cfg->lcdtogglekey = KEY_SELECT;
+                else if (strcmp(value, "KEY_START") == 0) cfg->lcdtogglekey = KEY_START;
             }
         }
     }
-    
     fclose(file);
-    printf("config loaded from %s\n", CONFIG_FILE);
 }
 
-int initsocket(const config *cfg) {
-    int sockfd;
-    struct sockaddr_in serveraddr;
-
-    if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
-        printf("socket creation failed\n");
-        return -1;
-    }
-
-    memset(&serveraddr, 0, sizeof(serveraddr));
+int initsocket(config *cfg) {
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) return -1;
     
+    struct sockaddr_in serveraddr;
+    memset(&serveraddr, 0, sizeof(serveraddr));
     serveraddr.sin_family = AF_INET;
     serveraddr.sin_port = htons(cfg->port);
     
     if (inet_pton(AF_INET, cfg->serverip, &serveraddr.sin_addr) <= 0) {
-        printf("invalid address\n");
         close(sockfd);
         return -1;
     }
     
-    if (connect(sockfd, (struct sockaddr*)&serveraddr, sizeof(serveraddr)) < 0) {
-        printf("connection failed\n");
+    if (connect(sockfd, (struct sockaddr *)&serveraddr, sizeof(serveraddr)) < 0) {
         close(sockfd);
         return -1;
     }
     
+    // Set socket to non-blocking so send/recv NEVER freeze the 3DS loop!
     int flags = fcntl(sockfd, F_GETFL, 0);
-    fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+    if (flags >= 0) {
+        fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+    }
     
     return sockfd;
 }
 
-int checkconnection(int sockfd) {
-    if (sockfd < 0) return 0;
-    
-    char ping_buf[6] = "ping";
-    char pong_buf[6] = {0};
-    
-    if (send(sockfd, ping_buf, 5, 0) <= 0) {
-        return 0;
-    }
-    
-    fd_set readfds;
-    struct timeval timeout;
-    
-    FD_ZERO(&readfds);
-    FD_SET(sockfd, &readfds);
-    
-    timeout.tv_sec = 4;
-    timeout.tv_usec = 0;
-    
-    if (select(sockfd + 1, &readfds, NULL, NULL, &timeout) > 0) {
-        ssize_t received = recv(sockfd, pong_buf, sizeof(pong_buf) - 1, 0);
-        if (received > 0) {
-            pong_buf[received] = '\0';
-            if (strcmp(pong_buf, "pong") == 0) {
-                return 1;
-            }
-        }
-    }
-    
-    return 0;
+void sendcontrollerstate(int sockfd, controllerstate *state) {
+    if (sockfd < 0) return;
+    send(sockfd, state, sizeof(controllerstate), 0);
 }
 
-int sendcontrollerstate(int sockfd, controllerstate *state) {
-    return send(sockfd, state, sizeof(controllerstate), 0);
-}
-
-void getbatterystatus(char *buffer, size_t size) {
-    u8 percentage;
-    PTMU_GetBatteryLevel(&percentage);
-    
-    u8 charging;
-    PTMU_GetBatteryChargeState(&charging);
-    
-    char icon[6];
-    int level = percentage;
-    
-    if (level < 0) level = 0;
-    if (level > 4) level = 4;
-    
-    for (int i = 0; i < 5; i++) {
-        icon[i] = (i <= level) ? '|' : ' ';
-    }
-    icon[5] = '\0';
-    
-    if (charging) {
-        snprintf(buffer, size, "[%s] +", icon);
-    } else {
-        snprintf(buffer, size, "[%s] %d%%", icon, (level + 1) * 20);
-    }
-}
-
-void printstatusmessage(int sockfd, const config *cfg, int isconnected, int lcdstate) {
-    consoleClear();
-    
-    char batterystatus[32];
-    getbatterystatus(batterystatus, sizeof(batterystatus));
-    
-    printf("\x1b[0;0H+----------------------+");
-    printf("\x1b[1;0H|    \x1b[1;36m3DS CONTROLLER\x1b[0m    |");
-    printf("\x1b[2;0H+----------------------+");
-    
-    if (isconnected) {
-        printf("\x1b[3;0H| Status: \x1b[32mCONNECTED\x1b[0m    |");
-    } else {
-        printf("\x1b[3;0H| Status: \x1b[31mNO CONNECTION\x1b[0m |");
-    }
-    
-    printf("\x1b[4;0H| IP: %-16s |", cfg->serverip);
-    printf("\x1b[5;0H| Port: %-15d |", cfg->port);
-    printf("\x1b[6;0H| Battery: %-11s |", batterystatus);
-    
-    if (lcdstate) {
-        printf("\x1b[7;0H| Display: \x1b[32mON\x1b[0m           |");
-    } else {
-        printf("\x1b[7;0H| Display: \x1b[31mOFF\x1b[0m          |");
-    }
-    
-    printf("\x1b[8;0H+----------------------+");
-    printf("\x1b[9;0H|      \x1b[1;33mCONTROLS\x1b[0m       |");
-    printf("\x1b[10;0H| CirclePad: Left Stick |");
-    printf("\x1b[11;0H| C-Stick: Right Stick  |");
-    printf("\x1b[12;0H| A/B/X/Y: Face Buttons |");
-    printf("\x1b[13;0H| L/R/ZL/ZR: Triggers   |");
-    printf("\x1b[14;0H| D-Pad: Directional    |");
-    
-    char keylabel[10] = "L";
-    if (cfg->lcdtogglekey == KEY_R) strcpy(keylabel, "R");
-    else if (cfg->lcdtogglekey == KEY_ZL) strcpy(keylabel, "ZL");
-    else if (cfg->lcdtogglekey == KEY_ZR) strcpy(keylabel, "ZR");
-    else if (cfg->lcdtogglekey == KEY_SELECT) strcpy(keylabel, "SELECT");
-    
-    printf("\x1b[15;0H| Hold %s: Toggle LCD   |", keylabel);
-    printf("\x1b[16;0H| START+SELECT: Exit    |");
-    printf("\x1b[17;0H+----------------------+");
+void togglelcd(bool *lcdon) {
+    gspLcdInit();
+    if (*lcdon) GSPLCD_PowerOffBacklight(GSPLCD_SCREEN_BOTH);
+    else GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTH);
+    gspLcdExit();
+    *lcdon = !(*lcdon);
 }
 
 int main(int argc, char **argv) {
     gfxInitDefault();
     consoleInit(GFX_TOP, NULL);
     
-    socInit((u32*)memalign(0x1000, 0x100000), 0x100000);
-    ptmuInit();
+    u32 *soc_buffer = (u32*)memalign(SOC_ALIGN, SOC_BUFFERSIZE);
+    if (!soc_buffer) {
+        gfxExit();
+        return -1;
+    }
+    
+    if (socInit(soc_buffer, SOC_BUFFERSIZE) != 0) {
+        free(soc_buffer);
+        gfxExit();
+        return -1;
+    }
     
     config cfg;
     readconfigfile(&cfg);
     
-    printf("3ds controller\n");
-    printf("connecting to pc at %s:%d...\n", cfg.serverip, cfg.port);
-    
     int sockfd = initsocket(&cfg);
     int isconnected = 0;
-    int lcdstate = 1;
-    u32 lcdtoggleheldtime = 0;
-    u32 connectionchecktime = 0;
     
-    printf("\ncalibrating circle pad...\n");
-    printf("leave circle pad untouched\n");
-    
-    for (int i = 0; i < 60; i++) {
-        gfxFlushBuffers();
-        gfxSwapBuffers();
-        gspWaitForVBlank();
+    // Send initial ping
+    if (sockfd >= 0) {
+        send(sockfd, "ping", 5, 0);
     }
     
-    printf("\ncalibration complete!\n");
-    
-    u32 laststatusupdate = 0;
+    u64 last_ping_sent = osGetTime();
+    u64 last_pong_received = 0;
+    bool lcdon = true;
+    u32 frame_count = 0;
     
     while (aptMainLoop()) {
         hidScanInput();
-        u32 keysdown = hidKeysHeld();
+        u32 kDown = hidKeysDown();
+        u32 kHeld = hidKeysHeld();
         
-        if ((keysdown & KEY_START) && (keysdown & KEY_SELECT)) 
-            break;
+        if ((kHeld & KEY_START) && (kHeld & KEY_SELECT)) break;
         
-        u32 currenttime = osGetTime();
-        
-        if (currenttime - connectionchecktime > 5000) {
-            isconnected = checkconnection(sockfd);
-            connectionchecktime = currenttime;
-            
-            if (!isconnected && sockfd >= 0) {
-                close(sockfd);
-                sockfd = -1;
-            } else if (!isconnected && sockfd < 0) {
-                sockfd = initsocket(&cfg);
-            }
+        if (kDown & cfg.lcdtogglekey) {
+            togglelcd(&lcdon);
         }
         
-        if (keysdown & cfg.lcdtogglekey) {
-            if (lcdtoggleheldtime == 0) {
-                lcdtoggleheldtime = currenttime;
-            } else if (currenttime - lcdtoggleheldtime > 1000) {
-                lcdstate = !lcdstate;
-                if (lcdstate) {
-                    gspLcdInit();
-                    GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTH);
-                } else {
-                    GSPLCD_PowerOffBacklight(GSPLCD_SCREEN_BOTH);
-                }
-                lcdtoggleheldtime = currenttime;
+        u64 currenttime = osGetTime();
+        
+        if (sockfd < 0) {
+            sockfd = initsocket(&cfg);
+        }
+        
+        // Check for any incoming "pong" non-blockingly (0ms wait)
+        if (sockfd >= 0) {
+            char pong_buf[16];
+            while (recv(sockfd, pong_buf, sizeof(pong_buf) - 1, 0) > 0) {
+                last_pong_received = currenttime;
+                isconnected = 1;
             }
-        } else {
-            lcdtoggleheldtime = 0;
+            
+            // Send a non-blocking ping every 3 seconds
+            if (currenttime - last_ping_sent > 3000) {
+                send(sockfd, "ping", 5, 0);
+                last_ping_sent = currenttime;
+            }
+            
+            // Only mark disconnected if no pong received for 10 seconds
+            if (isconnected && (currenttime - last_pong_received > 10000)) {
+                isconnected = 0;
+            }
         }
         
         controllerstate state;
-        memset(&state, 0, sizeof(controllerstate));
-        state.buttons = keysdown;
-        
+        state.buttons = kHeld;
         hidCircleRead(&state.circlepad);
         hidCstickRead(&state.cstick);
         
-        if (isconnected) {
+        // Always send controller inputs at full 60Hz!
+        if (sockfd >= 0) {
             sendcontrollerstate(sockfd, &state);
         }
         
-        if (currenttime - laststatusupdate > 3000) {
-            printstatusmessage(sockfd, &cfg, isconnected, lcdstate);
-            laststatusupdate = currenttime;
+        // Update console text every 10 frames (~6 times/sec) so printf doesn't lag the CPU
+        if (frame_count % 10 == 0) {
+            printf("\x1b[1;1H3DS Controller (60Hz Low-Latency)");
+            printf("\x1b[2;1HServer: %s:%d   ", cfg.serverip, cfg.port);
+            printf("\x1b[3;1HStatus: %s   ", isconnected ? "\x1b[32mCONNECTED\x1b[0m" : "\x1b[31mWAITING...\x1b[0m");
+            printf("\x1b[5;1HButtons: 0x%08lX   ", state.buttons);
+            printf("\x1b[6;1HCircle Pad: X=%4d Y=%4d   ", state.circlepad.dx, state.circlepad.dy);
+            printf("\x1b[7;1HC-Stick:    X=%4d Y=%4d   ", state.cstick.dx, state.cstick.dy);
+            printf("\x1b[9;1HPress START+SELECT to exit");
+            gfxFlushBuffers();
+            gfxSwapBuffers();
         }
         
-        gfxFlushBuffers();
-        gfxSwapBuffers();
-        
-        gspWaitForVBlank();
-
-        // i accidently flooded my network so this was added lol
-        svcSleepThread(33333333);
+        frame_count++;
+        gspWaitForVBlank(); // Pure 60 FPS (16.6ms) — no svcSleepThread!
     }
     
-    if (sockfd >= 0) {
-        close(sockfd);
+    if (!lcdon) {
+        gspLcdInit();
+        GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTH);
+        gspLcdExit();
     }
     
-    ptmuExit();
+    if (sockfd >= 0) close(sockfd);
     socExit();
+    free(soc_buffer);
     gfxExit();
     return 0;
 }
