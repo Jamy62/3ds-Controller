@@ -17,7 +17,7 @@
 #define DEFAULT_SERVER_IP "192.168.1.1"
 #define CONFIG_FILE "config.ini"
 #define MAX_LINE 256
-#define LCD_TOGGLE_KEY KEY_L
+#define LCD_TOGGLE_KEY KEY_SELECT
 
 typedef struct {
     u32 buttons;
@@ -42,7 +42,7 @@ void readconfigfile(config *cfg) {
         if (file) {
             fprintf(file, "serverip=%s\n", DEFAULT_SERVER_IP);
             fprintf(file, "port=%d\n", DEFAULT_PORT);
-            fprintf(file, "lcdtogglekey=KEY_L\n");
+            fprintf(file, "lcdtogglekey=KEY_SELECT\n");
             fclose(file);
         }
         return;
@@ -54,7 +54,7 @@ void readconfigfile(config *cfg) {
         if (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[len-1] = '\0';
         if (len > 1 && (line[len-2] == '\r')) line[len-2] = '\0';
         
-        char * delimiter = strchr(line, '=');
+        char *delimiter = strchr(line, '=');
         if (delimiter) {
             *delimiter = '\0';
             char *key = line;
@@ -96,18 +96,12 @@ int initsocket(config *cfg) {
         return -1;
     }
     
-    // Set socket to non-blocking so send/recv NEVER freeze the 3DS loop!
     int flags = fcntl(sockfd, F_GETFL, 0);
     if (flags >= 0) {
         fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
     }
     
     return sockfd;
-}
-
-void sendcontrollerstate(int sockfd, controllerstate *state) {
-    if (sockfd < 0) return;
-    send(sockfd, state, sizeof(controllerstate), 0);
 }
 
 void togglelcd(bool *lcdon) {
@@ -140,15 +134,16 @@ int main(int argc, char **argv) {
     int sockfd = initsocket(&cfg);
     int isconnected = 0;
     
-    // Send initial ping
+    u64 currenttime = osGetTime();
+    u64 last_ping_sent = currenttime;
+    u64 last_pong_received = currenttime;
+    u64 last_socket_reset = currenttime;
+    bool lcdon = true;
+    u32 frame_count = 0;
+    
     if (sockfd >= 0) {
         send(sockfd, "ping", 5, 0);
     }
-    
-    u64 last_ping_sent = osGetTime();
-    u64 last_pong_received = 0;
-    bool lcdon = true;
-    u32 frame_count = 0;
     
     while (aptMainLoop()) {
         hidScanInput();
@@ -161,13 +156,14 @@ int main(int argc, char **argv) {
             togglelcd(&lcdon);
         }
         
-        u64 currenttime = osGetTime();
+        currenttime = osGetTime();
         
         if (sockfd < 0) {
             sockfd = initsocket(&cfg);
+            last_socket_reset = currenttime;
+            if (sockfd >= 0) send(sockfd, "ping", 5, 0);
         }
         
-        // Check for any incoming "pong" non-blockingly (0ms wait)
         if (sockfd >= 0) {
             char pong_buf[16];
             while (recv(sockfd, pong_buf, sizeof(pong_buf) - 1, 0) > 0) {
@@ -175,15 +171,18 @@ int main(int argc, char **argv) {
                 isconnected = 1;
             }
             
-            // Send a non-blocking ping every 3 seconds
-            if (currenttime - last_ping_sent > 3000) {
+            if (currenttime - last_ping_sent > 2000) {
                 send(sockfd, "ping", 5, 0);
                 last_ping_sent = currenttime;
             }
             
-            // Only mark disconnected if no pong received for 10 seconds
-            if (isconnected && (currenttime - last_pong_received > 10000)) {
+            // Auto-heal socket in <1ms if no pong for 4.5s (fixes 1-hour router key renewal!)
+            if (currenttime - last_pong_received > 4500 && currenttime - last_socket_reset > 4500) {
                 isconnected = 0;
+                close(sockfd);
+                sockfd = initsocket(&cfg);
+                last_socket_reset = currenttime;
+                if (sockfd >= 0) send(sockfd, "ping", 5, 0);
             }
         }
         
@@ -192,16 +191,20 @@ int main(int argc, char **argv) {
         hidCircleRead(&state.circlepad);
         hidCstickRead(&state.cstick);
         
-        // Always send controller inputs at full 60Hz!
         if (sockfd >= 0) {
-            sendcontrollerstate(sockfd, &state);
+            if (send(sockfd, &state, sizeof(controllerstate), 0) < 0) {
+                if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    close(sockfd);
+                    sockfd = initsocket(&cfg);
+                    last_socket_reset = currenttime;
+                }
+            }
         }
         
-        // Update console text every 10 frames (~6 times/sec) so printf doesn't lag the CPU
         if (frame_count % 10 == 0) {
-            printf("\x1b[1;1H3DS Controller (60Hz Low-Latency)");
+            printf("\x1b[1;1H3DS Controller (60Hz Auto-Heal)");
             printf("\x1b[2;1HServer: %s:%d   ", cfg.serverip, cfg.port);
-            printf("\x1b[3;1HStatus: %s   ", isconnected ? "\x1b[32mCONNECTED\x1b[0m" : "\x1b[31mWAITING...\x1b[0m");
+            printf("\x1b[3;1HStatus: %s   ", isconnected ? "\x1b[32mCONNECTED\x1b[0m" : "\x1b[31mRECONNECTING...\x1b[0m");
             printf("\x1b[5;1HButtons: 0x%08lX   ", state.buttons);
             printf("\x1b[6;1HCircle Pad: X=%4d Y=%4d   ", state.circlepad.dx, state.circlepad.dy);
             printf("\x1b[7;1HC-Stick:    X=%4d Y=%4d   ", state.cstick.dx, state.cstick.dy);
@@ -211,7 +214,7 @@ int main(int argc, char **argv) {
         }
         
         frame_count++;
-        gspWaitForVBlank(); // Pure 60 FPS (16.6ms) — no svcSleepThread!
+        gspWaitForVBlank();
     }
     
     if (!lcdon) {
